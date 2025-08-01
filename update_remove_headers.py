@@ -1,15 +1,16 @@
 import datetime
+import os
 from pathlib import Path
 import shutil
 import subprocess
 import json
 import logging
 import tempfile
+import time
 from typing import TypedDict
 
 # Root logger
 logger = logging.getLogger(Path(__file__).name)
-
 
 # Constants
 URL = "https://owasp.org/www-project-secure-headers/ci/headers_remove.json"
@@ -37,82 +38,7 @@ class Curl:
         return self._execute(["-V"])
 
     def get_data(self, url: str, args: list[str] = ["-s", "-f", "-L"]) -> str:
-        # return self._execute([url, *args])
-        return """{
-  "last_update_utc": "2025-07-06 23:15:30",
-  "headers": [
-    "$wsep",
-    "Host-Header",
-    "K-Proxy-Request",
-    "Liferay-Portal",
-    "OracleCommerceCloud-Version",
-    "Pega-Host",
-    "Powered-By",
-    "Product",
-    "Server",
-    "SourceMap",
-    "X-AspNet-Version",
-    "X-AspNetMvc-Version",
-    "X-Atmosphere-error",
-    "X-Atmosphere-first-request",
-    "X-Atmosphere-tracking-id",
-    "X-B3-ParentSpanId",
-    "X-B3-Sampled",
-    "X-B3-SpanId",
-    "X-B3-TraceId",
-    "X-BEServer",
-    "X-Backside-Transport",
-    "X-CF-Powered-By",
-    "X-CMS",
-    "X-CalculatedBETarget",
-    "X-Cocoon-Version",
-    "X-Content-Encoded-By",
-    "X-DiagInfo",
-    "X-Envoy-Attempt-Count",
-    "X-Envoy-External-Address",
-    "X-Envoy-Internal",
-    "X-Envoy-Original-Dst-Host",
-    "X-Envoy-Upstream-Service-Time",
-    "X-FEServer",
-    "X-Framework",
-    "X-Generated-By",
-    "X-Generator",
-    "X-Jitsi-Release",
-    "X-Joomla-Version",
-    "X-Kubernetes-PF-FlowSchema-UI",
-    "X-Kubernetes-PF-PriorityLevel-UID",
-    "X-LiteSpeed-Cache",
-    "X-LiteSpeed-Purge",
-    "X-LiteSpeed-Tag",
-    "X-LiteSpeed-Vary",
-    "X-Litespeed-Cache-Control",
-    "X-Mod-Pagespeed",
-    "X-Nextjs-Cache",
-    "X-Nextjs-Matched-Path",
-    "X-Nextjs-Page",
-    "X-Nextjs-Redirect",
-    "X-OWA-Version",
-    "X-Old-Content-Length",
-    "X-OneAgent-JS-Injection",
-    "X-Page-Speed",
-    "X-Php-Version",
-    "X-Powered-By",
-    "X-Powered-By-Plesk",
-    "X-Powered-CMS",
-    "X-Redirect-By",
-    "X-Server-Powered-By",
-    "X-SourceFiles",
-    "X-SourceMap",
-    "X-Turbo-Charged-By",
-    "X-Umbraco-Version",
-    "X-Varnish-Backend",
-    "X-Varnish-Server",
-    "X-dtAgentId",
-    "X-dtHealthCheck",
-    "X-dtInjectedServlet",
-    "X-ruxit-JS-Agent"
-  ]
-}"""
+        return self._execute([url, *args])
 
 
 class _RemoveHeadersDict(TypedDict):
@@ -173,10 +99,11 @@ def get_date_from_yaml_config(path: Path) -> datetime.datetime:
         logger.error(
             f"Could not find last update timestamp, will generate new from {URL}"
         )
+    logger.debug(f"Timestamp found in yaml: {last_update_utc}")
     return last_update_utc
 
 
-def write_yaml_config(path: Path, remove_headers: RemoveHeaders):
+def write_yaml_config(path: Path, middleware_name: str, remove_headers: RemoveHeaders):
     ### As python does not have a yaml parser/writer in std, this will be best effort
 
     # Construct a 2d array where every row is a new indent and each column is
@@ -184,18 +111,16 @@ def write_yaml_config(path: Path, remove_headers: RemoveHeaders):
     string_2d = [
         [
             f"# DO NOT MODIFY. THIS FILE IS GENERATED FROM {URL}",
-            # FIXME: This timedelta is just for testing, remove it
-            f"# Updated on: {remove_headers.last_update_utc - datetime.timedelta(10)}",
+            f"# Updated on: {remove_headers.last_update_utc}",
             "http:",
         ],
         ["middlewares:"],
-        ["owasp_headers_remove:"],
+        [f"{middleware_name}:"],
         ["headers:"],
         ["customResponseHeaders:"],
         [*[f'{headers_str}: ""' for headers_str in remove_headers.headers]],
     ]
 
-    # Write headers to traefik config at `path`
     with open(path, "w") as f:
         indent_size = 2
         for tabs, strings_with_same_indent in enumerate(string_2d):
@@ -203,9 +128,7 @@ def write_yaml_config(path: Path, remove_headers: RemoveHeaders):
                 f.write(f"{' ' * indent_size * tabs}{string}\n")
 
 
-def main() -> int:
-    FILENAME = Path("middleware_owasp_headers_remove.yaml")
-
+def main(config: "Config") -> int:
     curl = Curl()
 
     if curl.command_exists():
@@ -228,10 +151,11 @@ def main() -> int:
         return 1
 
     # Get local version
-    if not FILENAME.exists():
-        logger.warning(f"Could not find {FILENAME}, generating new file from {URL}")
-    else:
-        last_update_utc = get_date_from_yaml_config(FILENAME)
+    tmp_dir: tempfile.TemporaryDirectory | None
+    old_file: Path | None
+    if config.config_path.exists():
+        tmp_dir = tempfile.TemporaryDirectory()
+        last_update_utc = get_date_from_yaml_config(config.config_path)
 
         # Check if our file is newer or equal to the web version
         if last_update_utc >= web_version.last_update_utc:
@@ -241,51 +165,294 @@ def main() -> int:
         # Our file was not up to date, save and update local headers
         logger.info("Found newer version, starting to update local version of headers")
 
-    # Save old yaml config to be able to go back to if the updated version generates errors
-    tmp_dir = tempfile.TemporaryDirectory()
-    shutil.copy2(FILENAME, tmp_dir.name)
-    old_file = Path(tmp_dir.name) / FILENAME.name
+        # Save old yaml config to be able to go back to if the updated version generates errors
+        logger.info("Making backup of current version")
+        shutil.copy2(config.config_path, tmp_dir.name)
+        old_file = Path(tmp_dir.name) / config.config_path.name
+    else:
+        tmp_dir = None
+        old_file = None
+        logger.warning(
+            f"Could not find {config.config_path}, generating new file from {URL}"
+        )
 
     # Have a big try except to catch if something goes wrong when updating file
     try:
-        # Write headers to traefik config: middleware_owasp_headers_remove.yaml
-        write_yaml_config(FILENAME, web_version)
+        logger.debug(f"Write headers to traefik config at `{config.config_path}`")
+        if config.traefik_log is not None:
+            # save timestamp so we know where we need to start the search from
+            timestamp_before_writing = datetime.datetime.now().astimezone()
 
-        # restart traefik to see if the change generated errors
-        ### If the change generates errors we go back to the old version
-        # TODO
+        write_yaml_config(
+            config.config_path,
+            config.middleware_header,
+            web_version,
+        )
+
+        if config.restart_traefik:
+            logger.info("Restarting Traefik to apply changes")
+            traefik_restart_proc = subprocess.run(config.traefik_restart_cmd.split())
+            traefik_restart_proc.check_returncode()
+            logger.debug("traefik restart with 0 as exit code")
+
+        # If the change generates errors we go back to the old version
+        if config.traefik_log is not None:
+            logger.info(
+                f"Reading traefik logs for {config.wait_for_errors_time} seconds at: {config.traefik_log}"
+            )
+            end_time = time.time() + config.wait_for_errors_time
+            with open(config.traefik_log) as f:
+                log_msg = ""
+                while time.time() <= end_time or config.wait_for_errors_time == 0:
+                    for line in f:
+                        try:
+                            timestamp = datetime.datetime.fromisoformat(
+                                line.split()[0].strip()
+                            )
+                            log_msg = line
+                        except Exception:
+                            # If we get here we know that we are still on the same log message
+                            # So we append it do the log_msg string
+                            log_msg += f"\n{line}"
+                            continue
+                        if (
+                            timestamp_before_writing
+                            <= timestamp  # Timestamp is after writing the file
+                            and "ERR" in log_msg  # There is an error
+                            and (
+                                config.middleware_header in log_msg
+                                or config.config_path.name in log_msg
+                            )  # The error contain our header or file
+                        ):
+                            raise RuntimeError(
+                                f"Found errors in {config.traefik_log} that could be caused by the update"
+                            )
+                    if config.wait_for_errors_time == 0:
+                        # the wait time is zero, so we will just run through lines ones.
+                        break
+            logger.info(
+                f"Found no errors in log, related to {config.middleware_header} or {config.config_path}"
+            )
 
     except Exception as err:
+        logger.error(
+            f"Something went wrong when updating, reverting changes. Error: {err}"
+        )
         # Remove the newly written yaml config
+        if config.config_path.exists():
+            os.remove(config.config_path)
 
         # Move back the old file
-        pass
-    tmp_dir.cleanup()
+        if tmp_dir is not None and old_file is not None and old_file.exists():
+            shutil.copy2(old_file, config.config_path)
+            if config.restart_traefik:
+                logger.info("Restarting Traefik to revert changes")
+                traefik_restart_proc = subprocess.run(
+                    config.traefik_restart_cmd.split()
+                )
 
+    if tmp_dir is not None:
+        tmp_dir.cleanup()
+
+    logger.info("Update was successful")
     return 0
 
 
-def setup_logging():
-    # logging.basicConfig(filename="myapp.log", level=logging.INFO)
+def setup_logging(config: "Config"):
     log_formatter = logging.Formatter(
         "%(asctime)s [%(levelname)-4.7s] %(filename)s:%(lineno)d  %(message)s"
     )
-    fileHandler = logging.FileHandler(f"{Path(__file__).name}.log")
 
-    fileHandler.setFormatter(log_formatter)
-    logger.addHandler(fileHandler)
+    if config.log_path is not None:
+        fileHandler = logging.FileHandler(config.log_path)
+        fileHandler.setFormatter(log_formatter)
+        logger.addHandler(fileHandler)
 
     consoleHandler = logging.StreamHandler()
     consoleHandler.setFormatter(log_formatter)
     logger.addHandler(consoleHandler)
-    logger.setLevel(logging.INFO)
+    logger.setLevel(config.log_level)
+
+
+class Config:
+    def __init__(
+        self,
+        *,
+        config_path: str,
+        middleware_header: str,
+        restart_traefik: bool,
+        traefik_restart_cmd: str,
+        wait_for_errors_time: str,
+        log_level: str,
+        log_path: str | None,
+        traefik_log: str | None,
+    ):
+        if not wait_for_errors_time.isdigit():
+            raise ValueError(
+                "The given wait for errors time is not a valid digit/number"
+            )
+        self._wait_for_errors_time = int(wait_for_errors_time)
+
+        tmp_config_path = Path(config_path).resolve()
+        if not tmp_config_path.parent.exists():
+            raise ValueError(f"The given config path does not exist. {tmp_config_path}")
+        if not tmp_config_path.suffix.endswith(("yaml", "yml")):
+            raise ValueError(
+                "The given config file is expected to have the extension yml or yaml"
+            )
+        self._config_path = tmp_config_path
+
+        self._restart_traefik = restart_traefik
+
+        if middleware_header.strip() == "":
+            raise ValueError(f'The given middleware "{middleware_header}" is not valid')
+        else:
+            self._middleware_header = middleware_header
+
+        if traefik_restart_cmd.strip() == "":
+            raise ValueError(
+                f"The given restart command is empty. Command: {traefik_restart_cmd}"
+            )
+        else:
+            self._traefik_restart_cmd = traefik_restart_cmd
+
+        tmp_log_level = logging.getLevelNamesMapping().get(log_level.upper())
+        if tmp_log_level is None:
+            raise ValueError(
+                f'The given log level "{log_level}" is not a valid debug level. Valid levels: {list(logging.getLevelNamesMapping().keys())}'
+            )
+        self._log_level = tmp_log_level
+
+        if log_path is not None:
+            tmp_log_path = Path(log_path).resolve()
+            print(tmp_log_path.is_file())
+            if not tmp_log_path.parent.exists():
+                raise ValueError(
+                    f'The given "log_path" does not exist. The directory "{tmp_log_path.parent}" is expected to exist'
+                )
+
+            self._log_path = tmp_log_path
+        else:
+            self._log_path = None
+
+        if traefik_log is not None:
+            tmp_traefik_log = Path(traefik_log).resolve()
+            if not tmp_traefik_log.parent.exists() or not tmp_traefik_log.is_file():
+                raise ValueError(
+                    f"The given traefik_log path does not exist. {tmp_traefik_log}"
+                )
+            self._traefik_log = tmp_traefik_log
+        else:
+            self._traefik_log = None
+
+    @property
+    def log_level(self) -> int:
+        return self._log_level
+
+    @property
+    def log_path(self) -> Path | None:
+        return self._log_path
+
+    @property
+    def config_path(self) -> Path:
+        return self._config_path
+
+    @property
+    def middleware_header(self) -> str:
+        return self._middleware_header
+
+    @property
+    def traefik_log(self) -> Path | None:
+        return self._traefik_log
+
+    @property
+    def restart_traefik(self) -> bool:
+        return self._restart_traefik
+
+    @property
+    def traefik_restart_cmd(self) -> str:
+        return self._traefik_restart_cmd
+
+    @property
+    def wait_for_errors_time(self) -> int:
+        return self._wait_for_errors_time
+
+
+def cli() -> Config:
+    parser = argparse.ArgumentParser()
+
+    parser.add_argument(
+        "-c",
+        "--config-path",
+        required=True,
+        help="Path to where the generated config will be stored",
+    )
+    DEFAULT_MIDDLEWARE_HEADER = "owasp_headers_remove"
+    parser.add_argument(
+        "--middleware-header",
+        default=DEFAULT_MIDDLEWARE_HEADER,
+        help=f"The name of the middleware header. Default {DEFAULT_MIDDLEWARE_HEADER}",
+    )
+    DEFAULT_LOG_LEVEL = "INFO"
+    parser.add_argument(
+        "--log-level",
+        default=DEFAULT_LOG_LEVEL,
+        help=f"The log level. Default {DEFAULT_LOG_LEVEL}",
+    )
+    parser.add_argument(
+        "--log-path",
+        help="Path to log file. If not set no log file will be created",
+    )
+    parser.add_argument(
+        "--traefik-log",
+        help="The path to the log file for Traefik. This is used to check if the update generated any errors.",
+    )
+    DEFAULT_WAIT_FOR_ERRORS_TIME = "5"
+    parser.add_argument(
+        "--wait-for-errors-time",
+        default=DEFAULT_WAIT_FOR_ERRORS_TIME,
+        help=f"The wait time to wait for errors in the traefik log. Default {DEFAULT_WAIT_FOR_ERRORS_TIME}",
+    )
+    DEFAULT_RESTART_CMD = "systemctl restart traefik.service"
+    parser.add_argument(
+        "--traefik-restart-cmd",
+        default=DEFAULT_RESTART_CMD,
+        help=f'The command that will be used when restarting traefik. This is only used when "--restart-traefik" is given. Default {DEFAULT_RESTART_CMD}',
+    )
+    parser.add_argument(
+        "-r",
+        "--restart-traefik",
+        action="store_false",
+        help=f'Restart traefik with by default the command: "{DEFAULT_RESTART_CMD}" to apply changes. This can be changed with "--traefik-restart-cmd"',
+    )
+
+    args = parser.parse_args()
+
+    return Config(
+        config_path=args.config_path,
+        middleware_header=args.middleware_header,
+        restart_traefik=args.restart_traefik,
+        wait_for_errors_time=args.wait_for_errors_time,
+        traefik_restart_cmd=args.traefik_restart_cmd,
+        log_level=args.log_level,
+        log_path=args.log_path,
+        traefik_log=args.traefik_log,
+    )
 
 
 if __name__ == "__main__":
-    setup_logging()
+    import argparse
 
     # Handle cli
-    ### Generate config, which we give to main
-    # TODO
+    config = cli()
 
-    exit(main())
+    # Setup logging
+    setup_logging(config)
+
+    return_code = 1
+    try:
+        return_code = main(config)
+    except Exception as err:
+        logger.error(f"Got an error while running script. Error: {err}")
+
+    exit(return_code)
